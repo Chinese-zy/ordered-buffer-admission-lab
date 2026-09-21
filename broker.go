@@ -19,67 +19,105 @@ type Frame struct {
 
 // Broker is a small in-memory receive broker. A caller attaches a connection,
 // publishes complete frames, and receives them through the stable Receive API.
-// The initial implementation intentionally has one shared watermark; the
-// feature task asks for independent connection flow control without changing
-// these public method names.
+// Flow control is per connection: each connection has its own watermark,
+// sequence counter, and queue, so one slow connection never stalls the others.
 type Broker struct {
 	mu          sync.Mutex
 	maxBytes    int
 	maxFrame    int
-	buffered    int
-	nextSeq     uint64
-	closed      map[string]bool
-	frames      []Frame
+	conns       map[string]*connState
 	failPublish error
 }
 
-func New(maxBytes, maxFrame int) *Broker {
-	return &Broker{maxBytes: maxBytes, maxFrame: maxFrame, closed: make(map[string]bool)}
+type connState struct {
+	closed   bool
+	buffered int
+	nextSeq  uint64
+	frames   []Frame
 }
 
-func (b *Broker) Attach(conn string) { b.mu.Lock(); defer b.mu.Unlock(); delete(b.closed, conn) }
+func New(maxBytes, maxFrame int) *Broker {
+	return &Broker{maxBytes: maxBytes, maxFrame: maxFrame, conns: make(map[string]*connState)}
+}
+
+func (b *Broker) Attach(conn string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	cs := b.conns[conn]
+	if cs == nil {
+		cs = &connState{}
+		b.conns[conn] = cs
+	}
+	cs.closed = false
+}
 
 func (b *Broker) Cancel(conn string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.closed[conn] = true
-	for i := 0; i < len(b.frames); {
-		if b.frames[i].Conn == conn {
-			b.buffered -= len(b.frames[i].Data)
-			b.frames = append(b.frames[:i], b.frames[i+1:]...)
-			continue
-		}
-		i++
+	cs := b.conns[conn]
+	if cs == nil {
+		cs = &connState{}
+		b.conns[conn] = cs
 	}
+	cs.closed = true
+	cs.frames = nil
+	cs.buffered = 0
 }
 
-func (b *Broker) InjectPublishFailure(err error) { b.mu.Lock(); defer b.mu.Unlock(); b.failPublish = err }
+func (b *Broker) InjectPublishFailure(err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.failPublish = err
+}
 
 func (b *Broker) Publish(conn string, data []byte) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.closed[conn] { return ErrClosed }
-	if b.failPublish != nil { err := b.failPublish; b.failPublish = nil; return err }
-	if len(data) > b.maxFrame { return ErrFrameLarge }
-	if b.buffered+len(data) > b.maxBytes { return ErrFull }
-	b.nextSeq++
+	cs := b.conns[conn]
+	if cs == nil {
+		cs = &connState{}
+		b.conns[conn] = cs
+	}
+	if cs.closed {
+		return ErrClosed
+	}
+	if b.failPublish != nil {
+		err := b.failPublish
+		b.failPublish = nil
+		return err
+	}
+	if len(data) > b.maxFrame {
+		return ErrFrameLarge
+	}
+	if cs.buffered+len(data) > b.maxBytes {
+		return ErrFull
+	}
+	cs.nextSeq++
 	cp := append([]byte(nil), data...)
-	b.frames = append(b.frames, Frame{Seq: b.nextSeq, Conn: conn, Data: cp})
-	b.buffered += len(cp)
+	cs.frames = append(cs.frames, Frame{Seq: cs.nextSeq, Conn: conn, Data: cp})
+	cs.buffered += len(cp)
 	return nil
 }
 
 func (b *Broker) Receive(conn string) (Frame, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.closed[conn] { return Frame{}, false }
-	for i, f := range b.frames {
-		if f.Conn != conn { continue }
-		b.buffered -= len(f.Data)
-		b.frames = append(b.frames[:i], b.frames[i+1:]...)
-		return f, true
+	cs := b.conns[conn]
+	if cs == nil || cs.closed || len(cs.frames) == 0 {
+		return Frame{}, false
 	}
-	return Frame{}, false
+	f := cs.frames[0]
+	cs.frames = cs.frames[1:]
+	cs.buffered -= len(f.Data)
+	return f, true
 }
 
-func (b *Broker) Buffered() int { b.mu.Lock(); defer b.mu.Unlock(); return b.buffered }
+func (b *Broker) Buffered() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	total := 0
+	for _, cs := range b.conns {
+		total += cs.buffered
+	}
+	return total
+}
